@@ -1,0 +1,22 @@
+#!/bin/sh
+# ALINX AX7020 / Qwen3.5-0.8B interactive chat launcher (v3)
+#
+# Replaces the original launcher, which started a 6 KB stub that sliced
+# hidden[:64], searched only the first 1024 embeddings, and printed
+# "token_<id>" instead of text.  It never produced readable output.
+#
+# v3 runs the real 24-layer engine with ChatML and the special-token aware
+# tokenizer, on the CPU path only.
+#
+# The PL bitstream is deliberately NOT loaded: the gemv core in
+# system_dual.bit.bin was measured to be non-deterministic on hardware, so
+# inference stays on the ARM cores.
+
+mountpoint -q /mnt/qwen || mount /dev/mmcblk0p3 /mnt/qwen 2>/dev/null
+dmesg -n 1
+
+export QWEN_CPU_ONLY=1
+export OMP_NUM_THREADS=2
+
+cd /mnt/qwen || exit 1
+exec python3 -u /mnt/qwen/chat_v3.py "$@"

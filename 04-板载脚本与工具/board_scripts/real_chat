@@ -1,0 +1,7 @@
+#!/bin/bash
+# ALINX AX7020 / Qwen3.5-0.8B interactive chat launcher (M2a)
+mountpoint -q /mnt/qwen || mount /dev/mmcblk0p3 /mnt/qwen 2>/dev/null
+dmesg -n 1
+[ -e /dev/xdevcfg ] && cat /mnt/qwen/system_dual.bit.bin > /dev/xdevcfg 2>/dev/null
+export OMP_NUM_THREADS=2
+exec python3 /mnt/qwen/chat_board.py "$@"

@@ -1,0 +1,41 @@
+===== ALINX AX7020 / Qwen3.5-0.8B on-board acceptance =====
+1970-01-02 16:07:15
+kernel: 4.9.0-xilinx
+python: Python 3.4.2
+cores : 2
+weights: 643362048 bytes
+embed  : 134217728 bytes
+
+----- [1] prompt: The capital of France is
+Assistant:  Paris.
+The capital of France is Paris.
+The capital of France is
+----- elapsed: 19903 ms
+
+----- [2] prompt: hello
+Assistant: , i have a question about the following code:
+
+`
+    public class
+----- elapsed: 16163 ms
+
+----- [3] prompt: 1 2 3 4 5 6 7 8
+Assistant:  9 10 11 12 13 1
+----- elapsed: 28999 ms
+
+----- [4] prompt: def fibonacci(n):
+Assistant: 
+    if n < 0:
+        raise ValueError("n deve essere
+----- elapsed: 20825 ms
+
+----- [5] prompt: import numpy as np
+Assistant: 
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+
+#
+----- elapsed: 18766 ms
+
+===== end =====

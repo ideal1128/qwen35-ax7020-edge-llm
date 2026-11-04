@@ -1,0 +1,1049 @@
+// =============================================================================
+//  qwen_kernels.c  --  Optimized High-Performance C Engine Runtime
+//
+//  Key optimizations:
+//    1. GDN column-blocked row-wise loop fusion: 16 KB submatrix fits in 32 KB L1
+//       D-cache, eliminates L1 cache thrashing and store-forwarding stalls (74 -> ~15 ms).
+//    2. Compiled C forward runtime (forward_linear_layer / forward_mlp / forward_token_c):
+//       fuses all 14 kernel calls per linear layer inside C, eliminating 133 ms of Python
+//       ctypes dispatch overhead.
+//    3. NEON SIMD + OpenMP dual-core parallelism for all operations.
+//    4. Exact mathematical equivalence with Qwen3.5-0.8B BFP8 baseline.
+// =============================================================================
+
+// Needed for clock_gettime/CLOCK_MONOTONIC under -std=c99 (glibc hides POSIX
+// declarations unless this is defined before the first system header).
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdint.h>
+#include <string.h>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#include <arm_neon.h>
+#define USE_NEON 1
+#endif
+
+// Prefetch distance for lm_head_argmax, in bf16 ELEMENTS (x2 = bytes).
+//
+// MEASURED 2026-11 on the real 134 MB table, best of 5, all id=4036:
+//   256 el (512 B) -> 116.272 ms (1154 MB/s)   <- old value
+//    64 el (128 B) -> 113.897 ms (1178 MB/s)
+//    48 el ( 96 B) -> 113.282 ms (1185 MB/s)   <- adopted
+//    32 el ( 64 B) -> 114.201 ms (1175 MB/s)
+// The row-pair loop advances only 16 B per iteration per row, so a 512 B lead
+// runs far past the two rows in flight and thrashes; 96 B keeps the PLD inside
+// the window the loop will actually consume next.  Re-confirmed as a direct
+// A/B on the shipped .so, back-to-back on one boot:
+//   116.272 ms -> 113.405 ms (-2.5%).  A prefetch hint cannot change results.
+#ifndef PFD
+#define PFD 48
+#endif
+#ifndef PFL
+#define PFL 0
+#endif
+// Prefetch distance (bytes) for the gemv row-pair inner loop.
+//
+// MEASURED: hoisting the prefetch out of the i-loop to the block level (4 PLDs
+// per 64-byte block instead of 8) made the token 826 ms instead of 786 ms, and
+// removing prefetch entirely gave 921 ms.  The per-16-byte PLDs are therefore
+// earning their issue slots -- they hide latency better than the 4 saved slots
+// cost.  The original 96-byte distance is kept; only the value is parameterized
+// so it can be re-swept.
+#ifndef PFDIST
+#define PFDIST 96
+#endif
+
+// ---------------------------------------------------------------------------
+// Stage profiler.  Enabled at runtime from Python (QWEN_PROFILE=1) via
+// qwen_prof_enable(1).  Accumulates CLOCK_MONOTONIC milliseconds per slot.
+// clock_gettime is a vDSO call (~1 us) against ~4 ms gemv calls, so enabling
+// this perturbs the total by well under 1%.
+// ---------------------------------------------------------------------------
+#include <time.h>
+
+enum {
+    QP_GEMV = 0, QP_LMHEAD, QP_GDN, QP_CONV, QP_SWIGLU, QP_RMSNORM,
+    QP_GATES, QP_QK, QP_GATED, QP_RESID, QP_EMBED, QP_PYCALLBACK,
+    QP_LINEAR, QP_MLP, QP_TOTAL, QP_N
+};
+
+static const char* QP_NAMES[QP_N] = {
+    "bfp8_gemv", "lm_head_argmax", "gdn_recurrent_step", "conv1d_silu",
+    "swiglu", "rmsnorm", "gdn_gates", "qk_l2norm", "rmsnorm_gated",
+    "add_residual", "embed_lookup", "py_full_attn", "forward_linear_layer",
+    "forward_mlp", "forward_token_c"
+};
+
+static int g_qp_on = 0;
+static double g_qp_ms[QP_N];
+
+void qwen_prof_enable(int on) { g_qp_on = on; }
+void qwen_prof_reset(void) { for (int i = 0; i < QP_N; i++) g_qp_ms[i] = 0.0; }
+int qwen_prof_count(void) { return QP_N; }
+double qwen_prof_get(int i) { return (i >= 0 && i < QP_N) ? g_qp_ms[i] : 0.0; }
+const char* qwen_prof_name(int i) { return (i >= 0 && i < QP_N) ? QP_NAMES[i] : "?"; }
+
+static inline double qp_now(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1.0e6;
+}
+
+// Time a single statement into slot id (no-op when profiling is off).
+#define QP_TIME(id, stmt) do { \
+    if (g_qp_on) { double _qpt = qp_now(); stmt; g_qp_ms[id] += qp_now() - _qpt; } \
+    else { stmt; } } while (0)
+
+static float EXP_SCALE[256];
+
+// ---- BFP4 feasibility probe -------------------------------------------
+// Compiling with -DBFP4_SIM rounds every weight mantissa to a multiple of 16.
+// Because the block exponent is left alone, the resulting value is
+//     m4 * 16 * 2^(exp-134)
+// which is exactly what a 4-bit mantissa with the exponent bumped by 4 would
+// produce.  So this measures the ACCURACY cost of 4-bit weights without
+// building a new 321 MB weight file or a new kernel.
+//
+// It adds two NEON ops per vector, so timings in this mode are meaningless --
+// this is an accuracy probe only.  If the model still produces the same token
+// ids, the real 4-bit path is worth building (it would halve the bytes read
+// per token and roughly double throughput).
+#if defined(BFP4_SIM)
+#define W4V(v16) vandq_s16(vaddq_s16((v16), vdupq_n_s16(8)), \
+                           vdupq_n_s16((short)0xFFF0))
+#define W4S(w)   ((((int)(w)) + 8) & ~15)
+#else
+#define W4V(v16) (v16)
+#define W4S(w)   ((int)(w))
+#endif
+static int TABLE_INITIALIZED = 0;
+
+void init_kernels() {
+    if (!TABLE_INITIALIZED) {
+        for (int i = 0; i < 256; i++) {
+            EXP_SCALE[i] = ldexpf(1.0f, i - 134);
+        }
+        TABLE_INITIALIZED = 1;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 1. RMSNorm
+// ---------------------------------------------------------------------------
+void rmsnorm(float* y, const float* x, const float* w, int n, float eps) {
+    float sum_sq = 0.0f;
+#if defined(USE_NEON)
+    float32x4_t s4 = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 4 <= n; i += 4) {
+        float32x4_t v = vld1q_f32(x + i);
+        s4 = vmlaq_f32(s4, v, v);
+    }
+    float32x2_t s2 = vadd_f32(vget_low_f32(s4), vget_high_f32(s4));
+    s2 = vpadd_f32(s2, s2);
+    sum_sq = vget_lane_f32(s2, 0);
+    for (; i < n; i++) sum_sq += x[i] * x[i];
+#else
+    for (int i = 0; i < n; i++) sum_sq += x[i] * x[i];
+#endif
+    float rsqrt_val = 1.0f / sqrtf((sum_sq / (float)n) + eps);
+#if defined(USE_NEON)
+    float32x4_t r4 = vdupq_n_f32(rsqrt_val);
+    float32x4_t one4 = vdupq_n_f32(1.0f);
+    for (i = 0; i + 4 <= n; i += 4) {
+        float32x4_t xv = vld1q_f32(x + i);
+        float32x4_t wv = vld1q_f32(w + i);
+        float32x4_t scale = vmulq_f32(r4, vaddq_f32(one4, wv));
+        vst1q_f32(y + i, vmulq_f32(xv, scale));
+    }
+    for (; i < n; i++) y[i] = x[i] * rsqrt_val * (1.0f + w[i]);
+#else
+    for (int i = 0; i < n; i++) {
+        y[i] = x[i] * rsqrt_val * (1.0f + w[i]);
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 2. BFP8 GEMV (NEON int8xint16 integer arithmetic + block scaling)
+// ---------------------------------------------------------------------------
+static int16_t g_xq[4096];
+static float   g_xscale[64];
+static const float* g_last_x = NULL;
+static int g_last_K = 0;
+
+static void quant_x_blocks(const float* x, int K) {
+    if (x == g_last_x && K == g_last_K) return;
+    int num_blocks = K / 64;
+    for (int b = 0; b < num_blocks; b++) {
+        const float* xb = x + b * 64;
+        float amax = 0.0f;
+        for (int i = 0; i < 64; i++) {
+            float v = fabsf(xb[i]);
+            if (v > amax) amax = v;
+        }
+        if (amax > 1e-20f) {
+            float q = 16384.0f / amax;
+            g_xscale[b] = amax / 16384.0f;
+            for (int i = 0; i < 64; i++) {
+                g_xq[b * 64 + i] = (int16_t)lrintf(xb[i] * q);
+            }
+        } else {
+            g_xscale[b] = 0.0f;
+            memset(g_xq + b * 64, 0, 64 * sizeof(int16_t));
+        }
+    }
+    g_last_x = x;
+    g_last_K = K;
+}
+
+void bfp8_gemv(float* y, const float* x, const int8_t* mantissas,
+               const uint8_t* exps, int M, int K) {
+    if (!TABLE_INITIALIZED) init_kernels();
+    const int num_blocks = K / 64;
+    const int KB = num_blocks * 64;
+
+#if defined(USE_NEON)
+    if (K <= 4096) {
+        quant_x_blocks(x, K);
+
+        #pragma omp parallel for schedule(static) if (M >= 64)
+        for (int m = 0; m < (M & ~1); m += 2) {
+            const int8_t* row0 = mantissas + (size_t)m * K;
+            const int8_t* row1 = mantissas + (size_t)(m + 1) * K;
+            const uint8_t* e0  = exps + (size_t)m * num_blocks;
+            const uint8_t* e1  = exps + (size_t)(m + 1) * num_blocks;
+            float32x4_t fs0 = vdupq_n_f32(0.0f);
+            float32x4_t fs1 = vdupq_n_f32(0.0f);
+
+            for (int b = 0; b < num_blocks; b++) {
+                const int8_t* w0b = row0 + b * 64;
+                const int8_t* w1b = row1 + b * 64;
+                const int16_t* xb = g_xq + b * 64;
+
+                int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
+                int32x4_t c0 = vdupq_n_s32(0), c1 = vdupq_n_s32(0);
+
+                for (int i = 0; i < 64; i += 16) {
+                    __builtin_prefetch(w0b + i + PFDIST, 0, 0);
+                    __builtin_prefetch(w1b + i + PFDIST, 0, 0);
+                    int16x8_t xa = vld1q_s16(xb + i);
+                    int16x8_t xc = vld1q_s16(xb + i + 8);
+
+                    // Row 0 then row 1, reusing wl/wh: keeps only 11 of the 16
+                    // NEON registers live instead of 14, avoiding spills.
+                    int8x16_t w = vld1q_s8(w0b + i);
+                    int16x8_t wl = W4V(vmovl_s8(vget_low_s8(w)));
+                    int16x8_t wh = W4V(vmovl_s8(vget_high_s8(w)));
+                    a0 = vmlal_s16(a0, vget_low_s16(wl), vget_low_s16(xa));
+                    a0 = vmlal_s16(a0, vget_high_s16(wl), vget_high_s16(xa));
+                    a1 = vmlal_s16(a1, vget_low_s16(wh), vget_low_s16(xc));
+                    a1 = vmlal_s16(a1, vget_high_s16(wh), vget_high_s16(xc));
+
+                    w = vld1q_s8(w1b + i);
+                    wl = W4V(vmovl_s8(vget_low_s8(w)));
+                    wh = W4V(vmovl_s8(vget_high_s8(w)));
+                    c0 = vmlal_s16(c0, vget_low_s16(wl), vget_low_s16(xa));
+                    c0 = vmlal_s16(c0, vget_high_s16(wl), vget_high_s16(xa));
+                    c1 = vmlal_s16(c1, vget_low_s16(wh), vget_low_s16(xc));
+                    c1 = vmlal_s16(c1, vget_high_s16(wh), vget_high_s16(xc));
+                }
+                // Vector epilogue.  The old code pulled 8 int32 lanes out of
+                // NEON per block (vgetq_lane_s32 is a NEON->ARM transfer, ~3
+                // cycles plus a pipeline hazard); with ~3.5M block-iterations
+                // per token that is ~28M transfers.  Accumulate in NEON and
+                // extract one lane per row at the very end instead.
+                // Kept the original multiply order (dot*EXP_SCALE)*xscale so
+                // the float result is unchanged.
+                float32x4_t fA = vcvtq_f32_s32(vaddq_s32(a0, a1));
+                float32x4_t fC = vcvtq_f32_s32(vaddq_s32(c0, c1));
+                fs0 = vmlaq_n_f32(fs0, vmulq_n_f32(fA, EXP_SCALE[e0[b]]), g_xscale[b]);
+                fs1 = vmlaq_n_f32(fs1, vmulq_n_f32(fC, EXP_SCALE[e1[b]]), g_xscale[b]);
+            }
+            {
+                float32x2_t r0 = vadd_f32(vget_low_f32(fs0), vget_high_f32(fs0));
+                float32x2_t r1 = vadd_f32(vget_low_f32(fs1), vget_high_f32(fs1));
+                r0 = vpadd_f32(r0, r0);
+                r1 = vpadd_f32(r1, r1);
+                y[m]     = vget_lane_f32(r0, 0);
+                y[m + 1] = vget_lane_f32(r1, 0);
+            }
+        }
+        if (M & 1) {
+            const int m = M - 1;
+            const int8_t* row_m = mantissas + (size_t)m * K;
+            const uint8_t* row_e = exps + (size_t)m * num_blocks;
+            float sum = 0.0f;
+            for (int b = 0; b < num_blocks; b++) {
+                const int8_t* wb = row_m + b * 64;
+                const int16_t* xb = g_xq + b * 64;
+                int32x4_t acc0 = vdupq_n_s32(0);
+                int32x4_t acc1 = vdupq_n_s32(0);
+                for (int i = 0; i < 64; i += 16) {
+                    int8x16_t w = vld1q_s8(wb + i);
+                    int16x8_t wlo = W4V(vmovl_s8(vget_low_s8(w)));
+                    int16x8_t whi = W4V(vmovl_s8(vget_high_s8(w)));
+                    int16x8_t x0 = vld1q_s16(xb + i);
+                    int16x8_t x1 = vld1q_s16(xb + i + 8);
+                    acc0 = vmlal_s16(acc0, vget_low_s16(wlo), vget_low_s16(x0));
+                    acc0 = vmlal_s16(acc0, vget_high_s16(wlo), vget_high_s16(x0));
+                    acc1 = vmlal_s16(acc1, vget_low_s16(whi), vget_low_s16(x1));
+                    acc1 = vmlal_s16(acc1, vget_high_s16(whi), vget_high_s16(x1));
+                }
+                int32x4_t acc = vaddq_s32(acc0, acc1);
+                int32_t s = vgetq_lane_s32(acc, 0) + vgetq_lane_s32(acc, 1) +
+                            vgetq_lane_s32(acc, 2) + vgetq_lane_s32(acc, 3);
+                sum += (float)s * EXP_SCALE[row_e[b]] * g_xscale[b];
+            }
+            y[m] = sum;
+        }
+        return;
+    }
+#endif
+
+    #pragma omp parallel for schedule(static) if (M >= 64)
+    for (int m = 0; m < M; m++) {
+        const int8_t* row_m = mantissas + (size_t)m * K;
+        const uint8_t* row_e = exps + (size_t)m * num_blocks;
+        float sum = 0.0f;
+        for (int b = 0; b < num_blocks; b++) {
+            float scale = EXP_SCALE[row_e[b]];
+            const int8_t* blk_m = row_m + b * 64;
+            const float* blk_x = x + b * 64;
+            float block_dot = 0.0f;
+            for (int i = 0; i < 64; i++) block_dot += (float)W4S(blk_m[i]) * blk_x[i];
+            sum += block_dot * scale;
+        }
+        y[m] = sum;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. Fast Vector Exp / Div
+// ---------------------------------------------------------------------------
+#if defined(USE_NEON)
+static inline float32x4_t exp_neon(float32x4_t x) {
+    x = vmaxq_f32(x, vdupq_n_f32(-87.0f));
+    x = vminq_f32(x, vdupq_n_f32(88.0f));
+    float32x4_t fx = vmulq_f32(x, vdupq_n_f32(1.44269504088896341f));
+    float32x4_t magic = vdupq_n_f32(12582912.0f);
+    float32x4_t t = vaddq_f32(fx, magic);
+    float32x4_t n = vsubq_f32(t, magic);
+    float32x4_t f = vsubq_f32(fx, n);
+    float32x4_t p = vdupq_n_f32(1.5403530393381608e-4f);
+    p = vmlaq_f32(vdupq_n_f32(1.3333558146428443e-3f), p, f);
+    p = vmlaq_f32(vdupq_n_f32(9.6181291076284770e-3f), p, f);
+    p = vmlaq_f32(vdupq_n_f32(5.5504108664821580e-2f), p, f);
+    p = vmlaq_f32(vdupq_n_f32(2.4022650695910070e-1f), p, f);
+    p = vmlaq_f32(vdupq_n_f32(6.9314718055994530e-1f), p, f);
+    p = vmlaq_f32(vdupq_n_f32(1.0f), p, f);
+    int32x4_t e = vcvtq_s32_f32(n);
+    e = vaddq_s32(e, vdupq_n_s32(127));
+    float32x4_t sc = vreinterpretq_f32_s32(vshlq_n_s32(e, 23));
+    return vmulq_f32(p, sc);
+}
+
+static inline float32x4_t div_neon(float32x4_t a, float32x4_t b) {
+    float ta[4], tb[4];
+    vst1q_f32(ta, a);
+    vst1q_f32(tb, b);
+    ta[0] /= tb[0]; ta[1] /= tb[1]; ta[2] /= tb[2]; ta[3] /= tb[3];
+    return vld1q_f32(ta);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// 4. SwiGLU
+// ---------------------------------------------------------------------------
+void swiglu(float* y, const float* gate, const float* up, int n) {
+    int i = 0;
+#if defined(USE_NEON)
+    #pragma omp parallel for schedule(static) if (n >= 2048)
+    for (i = 0; i < (n & ~3); i += 4) {
+        float32x4_t g = vld1q_f32(gate + i);
+        float32x4_t e = exp_neon(vnegq_f32(g));
+        float32x4_t s = div_neon(g, vaddq_f32(vdupq_n_f32(1.0f), e));
+        vst1q_f32(y + i, vmulq_f32(s, vld1q_f32(up + i)));
+    }
+#else
+    #pragma omp parallel for schedule(static) if (n >= 2048)
+    for (i = 0; i < n; i++) {
+        float g = gate[i];
+        y[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+#endif
+    for (i = (n & ~3); i < n; i++) {
+        float g = gate[i];
+        y[i] = (g / (1.0f + expf(-g))) * up[i];
+    }
+}
+
+void add_residual(float* x, const float* res, int n) {
+    int i = 0;
+#if defined(USE_NEON)
+    for (; i + 4 <= n; i += 4) {
+        vst1q_f32(x + i, vaddq_f32(vld1q_f32(x + i), vld1q_f32(res + i)));
+    }
+#endif
+    for (; i < n; i++) x[i] += res[i];
+}
+
+// ---------------------------------------------------------------------------
+// 5. LM Head Argmax
+// ---------------------------------------------------------------------------
+int lm_head_argmax(const float* h, const uint16_t* embed_table, int vocab_size, int hidden_dim) {
+    float best_score = -1e30f;
+    int best_id = 0;
+
+#if defined(_OPENMP) && defined(USE_NEON)
+    float thread_best_score[2] = {-1e30f, -1e30f};
+    int   thread_best_id[2]    = {0, 0};
+
+    #pragma omp parallel num_threads(2)
+    {
+        int tid = omp_get_thread_num();
+        int chunk = vocab_size / 2;
+        int start = tid * chunk;
+        int end = (tid == 1) ? vocab_size : (start + chunk);
+
+        float my_best_score = -1e30f;
+        int my_best_id = start;
+
+        // Two rows per pass: the h[i]/h[i+4] loads (L1 hits but still issue
+        // slots) are shared, cutting the inner loop from 8 ops per 8 elements
+        // to 14 per 16 (0.875 vs 1.0 ops/element).  Tie-breaking is preserved
+        // by comparing row A before row B, matching the ascending t order.
+        int t = start;
+        for (; t + 1 < end; t += 2) {
+            const uint16_t* rowA = embed_table + (size_t)t * hidden_dim;
+            const uint16_t* rowB = rowA + hidden_dim;
+            float32x4_t a0 = vdupq_n_f32(0.0f), a1 = vdupq_n_f32(0.0f);
+            float32x4_t b0 = vdupq_n_f32(0.0f), b1 = vdupq_n_f32(0.0f);
+            int i = 0;
+            for (; i + 8 <= hidden_dim; i += 8) {
+                __builtin_prefetch(rowA + i + PFD, 0, PFL);
+                __builtin_prefetch(rowB + i + PFD, 0, PFL);
+                float32x4_t h0 = vld1q_f32(h + i);
+                float32x4_t h1 = vld1q_f32(h + i + 4);
+                uint16x8_t uA = vld1q_u16(rowA + i);
+                float32x4_t Alo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(uA), 16));
+                float32x4_t Ahi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(uA), 16));
+                a0 = vmlaq_f32(a0, Alo, h0);
+                a1 = vmlaq_f32(a1, Ahi, h1);
+                uint16x8_t uB = vld1q_u16(rowB + i);
+                float32x4_t Blo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(uB), 16));
+                float32x4_t Bhi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(uB), 16));
+                b0 = vmlaq_f32(b0, Blo, h0);
+                b1 = vmlaq_f32(b1, Bhi, h1);
+            }
+            float32x4_t accA = vaddq_f32(a0, a1);
+            float32x2_t sA = vpadd_f32(vadd_f32(vget_low_f32(accA), vget_high_f32(accA)),
+                                       vadd_f32(vget_low_f32(accA), vget_high_f32(accA)));
+            float scoreA = vget_lane_f32(sA, 0);
+            if (scoreA > my_best_score) { my_best_score = scoreA; my_best_id = t; }
+
+            float32x4_t accB = vaddq_f32(b0, b1);
+            float32x2_t sB = vpadd_f32(vadd_f32(vget_low_f32(accB), vget_high_f32(accB)),
+                                       vadd_f32(vget_low_f32(accB), vget_high_f32(accB)));
+            float scoreB = vget_lane_f32(sB, 0);
+            if (scoreB > my_best_score) { my_best_score = scoreB; my_best_id = t + 1; }
+        }
+        for (; t < end; t++) {
+            const uint16_t* row = embed_table + (size_t)t * hidden_dim;
+            float32x4_t acc0 = vdupq_n_f32(0.0f);
+            float32x4_t acc1 = vdupq_n_f32(0.0f);
+            int i = 0;
+            for (; i + 8 <= hidden_dim; i += 8) {
+                __builtin_prefetch(row + i + PFD, 0, PFL);
+                uint16x8_t u = vld1q_u16(row + i);
+                float32x4_t lo = vreinterpretq_f32_u32(vshll_n_u16(vget_low_u16(u), 16));
+                float32x4_t hi = vreinterpretq_f32_u32(vshll_n_u16(vget_high_u16(u), 16));
+                acc0 = vmlaq_f32(acc0, lo, vld1q_f32(h + i));
+                acc1 = vmlaq_f32(acc1, hi, vld1q_f32(h + i + 4));
+            }
+            float32x4_t acc = vaddq_f32(acc0, acc1);
+            float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
+            s2 = vpadd_f32(s2, s2);
+            float score = vget_lane_f32(s2, 0);
+            if (score > my_best_score) { my_best_score = score; my_best_id = t; }
+        }
+        thread_best_score[tid] = my_best_score;
+        thread_best_id[tid] = my_best_id;
+    }
+
+    if (thread_best_score[0] >= thread_best_score[1]) {
+        best_score = thread_best_score[0];
+        best_id = thread_best_id[0];
+    } else {
+        best_score = thread_best_score[1];
+        best_id = thread_best_id[1];
+    }
+    return best_id;
+#else
+    for (int t = 0; t < vocab_size; t++) {
+        const uint16_t* row_u16 = embed_table + (size_t)t * hidden_dim;
+        float score = 0.0f;
+        for (int i = 0; i < hidden_dim; i++) {
+            uint32_t u32 = ((uint32_t)row_u16[i]) << 16;
+            float val;
+            memcpy(&val, &u32, 4);
+            score += h[i] * val;
+        }
+        if (score > best_score) {
+            best_score = score;
+            best_id = t;
+        }
+    }
+    return best_id;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 6. Causal Conv1D
+// ---------------------------------------------------------------------------
+void causal_conv1d_update_silu(
+    float* y, const float* x, float* conv_state, const float* weight, int channels) {
+    float* s0 = conv_state;
+    float* s1 = conv_state + channels;
+    float* s2 = conv_state + 2 * channels;
+    int c = 0;
+#if defined(USE_NEON)
+    #pragma omp parallel for schedule(static) if (channels >= 512)
+    for (c = 0; c < (channels & ~3); c += 4) {
+        float32x4_t xc = vld1q_f32(x + c);
+        float32x4x4_t wv = vld4q_f32(weight + (size_t)c * 4);
+        float32x4_t t0 = vld1q_f32(s0 + c);
+        float32x4_t t1 = vld1q_f32(s1 + c);
+        float32x4_t t2 = vld1q_f32(s2 + c);
+        float32x4_t d = vmulq_f32(wv.val[0], t0);
+        d = vmlaq_f32(d, wv.val[1], t1);
+        d = vmlaq_f32(d, wv.val[2], t2);
+        d = vmlaq_f32(d, wv.val[3], xc);
+        float32x4_t e = exp_neon(vnegq_f32(d));
+        vst1q_f32(y + c, div_neon(d, vaddq_f32(vdupq_n_f32(1.0f), e)));
+        vst1q_f32(s0 + c, t1);
+        vst1q_f32(s1 + c, t2);
+        vst1q_f32(s2 + c, xc);
+    }
+#endif
+    for (c = (channels & ~3); c < channels; c++) {
+        float xc = x[c];
+        float dot = weight[c * 4] * s0[c] + weight[c * 4 + 1] * s1[c] +
+                    weight[c * 4 + 2] * s2[c] + weight[c * 4 + 3] * xc;
+        y[c] = dot / (1.0f + expf(-dot));
+        s0[c] = s1[c]; s1[c] = s2[c]; s2[c] = xc;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 7. QK L2 Norm
+// ---------------------------------------------------------------------------
+void qk_l2norm(float* q, float* k, int num_heads, int head_dim) {
+    const float q_scale = 1.0f / sqrtf((float)head_dim);
+    const float eps = 1e-6f;
+
+    #pragma omp parallel for schedule(static) if (num_heads >= 4)
+    for (int h = 0; h < num_heads; h++) {
+        float* kh = k + h * head_dim;
+        float* qh = q + h * head_dim;
+        float k_sq = 0.0f, q_sq = 0.0f;
+#if defined(USE_NEON)
+        float32x4_t a4 = vdupq_n_f32(0.0f), b4 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 4 <= head_dim; i += 4) {
+            float32x4_t kv = vld1q_f32(kh + i);
+            float32x4_t qv = vld1q_f32(qh + i);
+            a4 = vmlaq_f32(a4, kv, kv);
+            b4 = vmlaq_f32(b4, qv, qv);
+        }
+        float32x2_t a2 = vpadd_f32(vadd_f32(vget_low_f32(a4), vget_high_f32(a4)),
+                                   vadd_f32(vget_low_f32(a4), vget_high_f32(a4)));
+        float32x2_t b2 = vpadd_f32(vadd_f32(vget_low_f32(b4), vget_high_f32(b4)),
+                                   vadd_f32(vget_low_f32(b4), vget_high_f32(b4)));
+        k_sq = vget_lane_f32(a2, 0);
+        q_sq = vget_lane_f32(b2, 0);
+        for (; i < head_dim; i++) { k_sq += kh[i] * kh[i]; q_sq += qh[i] * qh[i]; }
+#else
+        for (int i = 0; i < head_dim; i++) { k_sq += kh[i] * kh[i]; q_sq += qh[i] * qh[i]; }
+#endif
+        float k_rnorm = 1.0f / sqrtf(k_sq + eps);
+        float q_rnorm = q_scale / sqrtf(q_sq + eps);
+#if defined(USE_NEON)
+        float32x4_t k4 = vdupq_n_f32(k_rnorm), q4 = vdupq_n_f32(q_rnorm);
+        for (int i = 0; i + 4 <= head_dim; i += 4) {
+            vst1q_f32(kh + i, vmulq_f32(vld1q_f32(kh + i), k4));
+            vst1q_f32(qh + i, vmulq_f32(vld1q_f32(qh + i), q4));
+        }
+#else
+        for (int i = 0; i < head_dim; i++) { kh[i] *= k_rnorm; qh[i] *= q_rnorm; }
+#endif
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 8. GDN Gates
+// ---------------------------------------------------------------------------
+void gdn_gates(float* alpha, float* beta, const float* x,
+               const float* wa, const float* wb,
+               const float* neg_exp_alog, const float* dt, int H, int K) {
+    for (int h = 0; h < H; h++) {
+        const float* ra = wa + (size_t)h * K;
+        const float* rb = wb + (size_t)h * K;
+        float av = 0.0f, bv = 0.0f;
+        int i = 0;
+#if defined(USE_NEON)
+        float32x4_t a4 = vdupq_n_f32(0.0f), b4 = vdupq_n_f32(0.0f);
+        for (; i + 4 <= K; i += 4) {
+            float32x4_t xv = vld1q_f32(x + i);
+            a4 = vmlaq_f32(a4, vld1q_f32(ra + i), xv);
+            b4 = vmlaq_f32(b4, vld1q_f32(rb + i), xv);
+        }
+        float32x2_t t;
+        t = vpadd_f32(vadd_f32(vget_low_f32(a4), vget_high_f32(a4)),
+                      vadd_f32(vget_low_f32(a4), vget_high_f32(a4)));
+        av = vget_lane_f32(t, 0);
+        t = vpadd_f32(vadd_f32(vget_low_f32(b4), vget_high_f32(b4)),
+                      vadd_f32(vget_low_f32(b4), vget_high_f32(b4)));
+        bv = vget_lane_f32(t, 0);
+#endif
+        for (; i < K; i++) { av += ra[i] * x[i]; bv += rb[i] * x[i]; }
+        beta[h] = 1.0f / (1.0f + expf(-bv));
+        float z = av + dt[h];
+        alpha[h] = expf(neg_exp_alog[h] * log1pf(expf(z)));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 9. GDN Recurrent Step: blocked-transposed state + split read/write phases
+//
+// State layout (purely internal, the buffer is zero-initialised and only this
+// kernel ever touches it):
+//
+//     state[h][((jg*ng + ig)*4 + l)*4 + t] = S[h][4*ig + t][4*jg + l]
+//
+// i.e. the 128x128 state of one head is 32x32 blocks of 16 floats, block
+// (jg,ig) covering the four output columns j0..j0+3 crossed with the four input
+// indices i0..i0+3.  Within a block the four floats of one column j0+l are the
+// four consecutive i values, so a VLD4/VST4 moves one whole 4x4 block and hands
+// back val[t] = [S[i0+t][j0] .. S[i0+t][j0+3]] -- lanes are j, which is exactly
+// the 4-lane accumulator shape the maths wants (no horizontal sums anywhere):
+//     kv[j] = sum_i k[i]*S[i][j]  -> VMLA by scalar, ascending i
+//     T      = a*T + k*d          -> per-i vector axpy
+//
+// One pass over a column group reads its 2 KB, the second pass re-reads them
+// from L1 and writes the update back, so the state costs one DRAM read plus one
+// DRAM write per token (36 MB in total, the minimum for this recurrence).
+// GDN_CH column groups are handled per phase (1 = fused, 4 still fits L1 with
+// two threads) and the next group is prefetched while the current one is being
+// updated -- without that the kernel stalls on DRAM latency and drops from
+// ~880 MB/s to ~610 MB/s.
+//
+// BIT-EXACTNESS: the old kernel kept a 4-lane accumulator whose lanes were four
+// different j and fed it one input index i at a time, so every column's kv/qs
+// sum is a strictly ascending sum over i.  Here the four i offsets of each
+// block are accumulated in ascending order (t = 0..3, then the next block), so
+// the summation order is identical; qk, d, out and the state update keep the
+// same NEON operations (a*T first, then + k*d -- no FMA on Cortex-A9).
+// ---------------------------------------------------------------------------
+#ifndef GDN_CH
+#define GDN_CH 1                /* column groups (2 KB each) per phase */
+#endif
+#ifndef GDN_PF
+#define GDN_PF 1                /* 0 none, 1 next group in pass 2,
+                                   2 also in pass 1, 3 pass 1 prefetches the
+                                   group after next, 4 pass 2 with keep hint */
+#endif
+
+void gdn_recurrent_step(
+    float* attn_out, float* state, const float* q, const float* k, const float* v,
+    const float* alpha, const float* beta, int num_heads, int head_dim) {
+
+#if defined(USE_NEON)
+    // Per-head q^T k, computed exactly like the old kernel (4-lane accumulator
+    // over j, then vadd(low,high) + vpadd + lane 0).  num_heads == 16 here.
+    float qk_head[num_heads];
+    for (int h = 0; h < num_heads; h++) {
+        const float* qh = q + h * head_dim;
+        const float* kh = k + h * head_dim;
+        float32x4_t qk_acc = vdupq_n_f32(0.0f);
+        for (int j = 0; j < head_dim; j += 4) {
+            qk_acc = vmlaq_f32(qk_acc, vld1q_f32(qh + j), vld1q_f32(kh + j));
+        }
+        float32x2_t qk2 = vadd_f32(vget_low_f32(qk_acc), vget_high_f32(qk_acc));
+        qk2 = vpadd_f32(qk2, qk2);
+        qk_head[h] = vget_lane_f32(qk2, 0);
+    }
+
+    const int ng = head_dim >> 2;                    // 32 column groups
+    const size_t head_stride = (size_t)head_dim * head_dim;
+    const size_t grp_stride = (size_t)head_dim * 4;  // 2 KB per column group
+
+    #pragma omp parallel for schedule(static) collapse(2) if (num_heads >= 4)
+    for (int h = 0; h < num_heads; h++) {
+        for (int c0 = 0; c0 < ng; c0 += GDN_CH) {
+            float d_all[GDN_CH * 4];
+            const int cn = (c0 + GDN_CH <= ng) ? GDN_CH : (ng - c0);
+            float* base = state + (size_t)h * head_stride + (size_t)c0 * grp_stride;
+            const float* qh = q + h * head_dim;
+            const float* kh = k + h * head_dim;
+            const float* vh = v + h * head_dim;
+            float* outh = attn_out + h * head_dim;
+            const float a = alpha[h];
+            const float b = beta[h];
+            const float qk = qk_head[h];
+            float32x4_t a4 = vdupq_n_f32(a);
+            float32x4_t b4 = vdupq_n_f32(b);
+            float32x4_t qk4 = vdupq_n_f32(qk);
+
+            // ---- pass 1: kv / qs for every column group ----------------------
+            for (int g = 0; g < cn; g++) {
+                float* B = base + (size_t)g * grp_stride;
+                float32x4_t kv = vdupq_n_f32(0.0f);
+                float32x4_t qs = vdupq_n_f32(0.0f);
+                for (int ig = 0; ig < ng; ig++) {
+#if GDN_PF == 2
+                    if (c0 + g + 1 < ng) {
+                        __builtin_prefetch(B + grp_stride + ig * 16, 0, 0);
+                        __builtin_prefetch(B + grp_stride + ig * 16 + 8, 0, 0);
+                    }
+#elif GDN_PF == 3 || GDN_PF == 5
+                    if (c0 + g + 2 < ng) {
+                        __builtin_prefetch(B + 2 * grp_stride + ig * 16, 0, 0);
+                        __builtin_prefetch(B + 2 * grp_stride + ig * 16 + 8, 0, 0);
+                    }
+#elif GDN_PF == 6
+                    if (c0 + g + 1 < ng) {
+                        __builtin_prefetch(B + grp_stride + ig * 16, 0, 0);
+                        __builtin_prefetch(B + grp_stride + ig * 16 + 8, 0, 0);
+                    }
+#endif
+                    float32x4x4_t s = vld4q_f32(B + ig * 16);
+                    float32x4_t k4 = vld1q_f32(kh + ig * 4);
+                    float32x4_t q4 = vld1q_f32(qh + ig * 4);
+                    float32x2_t k4l = vget_low_f32(k4), k4h = vget_high_f32(k4);
+                    float32x2_t q4l = vget_low_f32(q4), q4h = vget_high_f32(q4);
+                    kv = vmlaq_lane_f32(kv, s.val[0], k4l, 0);
+                    qs = vmlaq_lane_f32(qs, s.val[0], q4l, 0);
+                    kv = vmlaq_lane_f32(kv, s.val[1], k4l, 1);
+                    qs = vmlaq_lane_f32(qs, s.val[1], q4l, 1);
+                    kv = vmlaq_lane_f32(kv, s.val[2], k4h, 0);
+                    qs = vmlaq_lane_f32(qs, s.val[2], q4h, 0);
+                    kv = vmlaq_lane_f32(kv, s.val[3], k4h, 1);
+                    qs = vmlaq_lane_f32(qs, s.val[3], q4h, 1);
+                }
+                // d / out: identical instruction sequence to the old kernel
+                const int j0 = (c0 + g) * 4;
+                float32x4_t d = vmulq_f32(
+                    vsubq_f32(vld1q_f32(vh + j0), vmulq_f32(kv, a4)), b4);
+                vst1q_f32(outh + j0, vmlaq_f32(vmulq_f32(qs, a4), qk4, d));
+                vst1q_f32(d_all + g * 4, d);
+            }
+
+            // ---- pass 2: T = a*T + k*d (blocks hot in L1) --------------------
+            for (int g = 0; g < cn; g++) {
+                float* B = base + (size_t)g * grp_stride;
+                float32x4_t d = vld1q_f32(d_all + g * 4);
+                for (int ig = 0; ig < ng; ig++) {
+#if GDN_PF == 1 || GDN_PF == 2
+                    if (c0 + g + 1 < ng) {
+                        __builtin_prefetch(B + grp_stride + ig * 16, 0, 0);
+                        __builtin_prefetch(B + grp_stride + ig * 16 + 8, 0, 0);
+                    }
+#elif GDN_PF == 3
+                    if (c0 + g + 1 < ng) {
+                        __builtin_prefetch(B + grp_stride + ig * 16, 0, 0);
+                        __builtin_prefetch(B + grp_stride + ig * 16 + 8, 0, 0);
+                    }
+#elif GDN_PF == 5 || GDN_PF == 6
+                    if (c0 + g + 2 < ng) {
+                        __builtin_prefetch(B + 2 * grp_stride + ig * 16, 0, 0);
+                        __builtin_prefetch(B + 2 * grp_stride + ig * 16 + 8, 0, 0);
+                    }
+#elif GDN_PF == 4
+                    if (c0 + g + 1 < ng) {
+                        __builtin_prefetch(B + grp_stride + ig * 16, 0, 3);
+                        __builtin_prefetch(B + grp_stride + ig * 16 + 8, 0, 3);
+                    }
+#endif
+                    float32x4x4_t s = vld4q_f32(B + ig * 16);
+                    float32x4_t k4 = vld1q_f32(kh + ig * 4);
+                    float32x2_t k4l = vget_low_f32(k4), k4h = vget_high_f32(k4);
+                    float32x4x4_t nv;
+                    nv.val[0] = vmlaq_lane_f32(vmulq_f32(s.val[0], a4), d, k4l, 0);
+                    nv.val[1] = vmlaq_lane_f32(vmulq_f32(s.val[1], a4), d, k4l, 1);
+                    nv.val[2] = vmlaq_lane_f32(vmulq_f32(s.val[2], a4), d, k4h, 0);
+                    nv.val[3] = vmlaq_lane_f32(vmulq_f32(s.val[3], a4), d, k4h, 1);
+                    vst4q_f32(B + ig * 16, nv);
+                }
+            }
+        }
+    }
+
+#else
+    // Scalar fallback (not built for the board): same blocked maths.
+    #pragma omp parallel for schedule(static) if (num_heads >= 4)
+    for (int h = 0; h < num_heads; h++) {
+        const float* qh = q + h * head_dim;
+        const float* kh = k + h * head_dim;
+        const float* vh = v + h * head_dim;
+        float* outh = attn_out + h * head_dim;
+        const float a = alpha[h];
+        const float b = beta[h];
+        float* S = state + (size_t)h * head_dim * head_dim;
+        float qk = 0.0f;
+        for (int i = 0; i < head_dim; i++) qk += qh[i] * kh[i];
+        for (int j0 = 0; j0 < head_dim; j0 += 4) {
+            float* B = S + (size_t)(j0 >> 2) * head_dim * 4;
+            float kv[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            float qs[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+            for (int i = 0; i < head_dim; i++) {
+                int blk = (i >> 2) * 16 + (i & 3);
+                for (int l = 0; l < 4; l++) {
+                    float t = B[blk + l * 4];
+                    kv[l] += kh[i] * t;
+                    qs[l] += qh[i] * t;
+                }
+            }
+            float dd[4];
+            for (int l = 0; l < 4; l++) {
+                float d = b * (vh[j0 + l] - a * kv[l]);
+                dd[l] = d;
+                outh[j0 + l] = a * qs[l] + qk * d;
+            }
+            for (int i = 0; i < head_dim; i++) {
+                int blk = (i >> 2) * 16 + (i & 3);
+                for (int l = 0; l < 4; l++) B[blk + l * 4] = a * B[blk + l * 4] + kh[i] * dd[l];
+            }
+        }
+    }
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 10. RMSNormGated
+// ---------------------------------------------------------------------------
+void rmsnorm_gated(float* y, const float* x, const float* z, const float* norm_w,
+                   int num_heads, int head_dim, float eps) {
+    #pragma omp parallel for schedule(static) if (num_heads >= 4)
+    for (int h = 0; h < num_heads; h++) {
+        const float* xh = x + h * head_dim;
+        const float* zh = z + h * head_dim;
+        float* yh = y + h * head_dim;
+        float sum_sq = 0.0f;
+#if defined(USE_NEON)
+        float32x4_t s4 = vdupq_n_f32(0.0f);
+        int i = 0;
+        for (; i + 4 <= head_dim; i += 4) {
+            float32x4_t xv = vld1q_f32(xh + i);
+            s4 = vmlaq_f32(s4, xv, xv);
+        }
+        float32x2_t s2 = vadd_f32(vget_low_f32(s4), vget_high_f32(s4));
+        s2 = vpadd_f32(s2, s2);
+        sum_sq = vget_lane_f32(s2, 0);
+        for (; i < head_dim; i++) sum_sq += xh[i] * xh[i];
+#else
+        for (int i = 0; i < head_dim; i++) sum_sq += xh[i] * xh[i];
+#endif
+        float rsqrt_val = 1.0f / sqrtf((sum_sq / (float)head_dim) + eps);
+        for (int i = 0; i < head_dim; i++) {
+            float zi = zh[i];
+            yh[i] = xh[i] * rsqrt_val * norm_w[i] * (zi / (1.0f + expf(-zi)));
+        }
+    }
+}
+
+// =============================================================================
+// Problem 2: Compiled C Forward Loop Runtime
+// =============================================================================
+
+typedef struct {
+    const float* in_ln_w;
+    const int8_t* mant_qkv;
+    const uint8_t* exp_qkv;
+    int M_qkv;
+    int K_qkv;
+    const float* conv_w;
+    float* conv_s;
+    const float* wa;
+    const float* wb;
+    const float* nea;
+    const float* dt;
+    float* state;
+    const int8_t* mant_z;
+    const uint8_t* exp_z;
+    int M_z;
+    int K_z;
+    const float* norm_w;
+    const int8_t* mant_o;
+    const uint8_t* exp_o;
+    int M_o;
+    int K_o;
+    const float* post_ln_w;
+    const int8_t* mant_gate;
+    const uint8_t* exp_gate;
+    int M_gate;
+    int K_gate;
+    const int8_t* mant_up;
+    const uint8_t* exp_up;
+    int M_up;
+    int K_up;
+    const int8_t* mant_down;
+    const uint8_t* exp_down;
+    int M_down;
+    int K_down;
+} LinearLayerPlan;
+
+typedef struct {
+    const float* post_ln_w;
+    const int8_t* mant_gate;
+    const uint8_t* exp_gate;
+    int M_gate;
+    int K_gate;
+    const int8_t* mant_up;
+    const uint8_t* exp_up;
+    int M_up;
+    int K_up;
+    const int8_t* mant_down;
+    const uint8_t* exp_down;
+    int M_down;
+    int K_down;
+} MlpPlan;
+
+typedef struct {
+    float normed[1024];
+    float qkv_buf[6144];
+    float mixed[6144];
+    float alpha[16];
+    float beta[16];
+    float attn_out[2048];
+    float z_buf[2048];
+    float gated_out[2048];
+    float o_buf[1024];
+    float post_normed[1024];
+    float gate_buf[3584];
+    float up_buf[3584];
+    float intermediate[3584];
+    float down_buf[1024];
+} LayerWorkspace;
+
+static LayerWorkspace g_workspace;
+
+void forward_linear_layer(const LinearLayerPlan* p, float* h) {
+    LayerWorkspace* ws = &g_workspace;
+    double _tl = g_qp_on ? qp_now() : 0.0;
+
+    // 1. In-RMSNorm
+    QP_TIME(QP_RMSNORM, rmsnorm(ws->normed, h, p->in_ln_w, 1024, 1e-6f));
+
+    // 2. QKV GEMV
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->qkv_buf, ws->normed, p->mant_qkv, p->exp_qkv, p->M_qkv, p->K_qkv));
+
+    // 3. Conv1D SiLU
+    QP_TIME(QP_CONV, causal_conv1d_update_silu(ws->mixed, ws->qkv_buf, p->conv_s, p->conv_w, 6144));
+
+    // 4. QK L2 Norm
+    float* q_ptr = ws->mixed;
+    float* k_ptr = ws->mixed + 2048;
+    float* v_ptr = ws->mixed + 4096;
+    QP_TIME(QP_QK, qk_l2norm(q_ptr, k_ptr, 16, 128));
+
+    // 5. GDN Gates
+    QP_TIME(QP_GATES, gdn_gates(ws->alpha, ws->beta, ws->normed, p->wa, p->wb, p->nea, p->dt, 16, 1024));
+
+    // 6. GDN Recurrent Step (Fused column-blocked row-wise pass!)
+    QP_TIME(QP_GDN, gdn_recurrent_step(ws->attn_out, p->state, q_ptr, k_ptr, v_ptr, ws->alpha, ws->beta, 16, 128));
+
+    // 7. Z GEMV
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->z_buf, ws->normed, p->mant_z, p->exp_z, p->M_z, p->K_z));
+
+    // 8. RMSNormGated
+    QP_TIME(QP_GATED, rmsnorm_gated(ws->gated_out, ws->attn_out, ws->z_buf, p->norm_w, 16, 128, 1e-6f));
+
+    // 9. O GEMV
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->o_buf, ws->gated_out, p->mant_o, p->exp_o, p->M_o, p->K_o));
+
+    // 10. Residual Add
+    QP_TIME(QP_RESID, add_residual(h, ws->o_buf, 1024));
+
+    // 11. Post-RMSNorm
+    QP_TIME(QP_RMSNORM, rmsnorm(ws->post_normed, h, p->post_ln_w, 1024, 1e-6f));
+
+    // 12. MLP Gate & Up GEMVs
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->gate_buf, ws->post_normed, p->mant_gate, p->exp_gate, p->M_gate, p->K_gate));
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->up_buf, ws->post_normed, p->mant_up, p->exp_up, p->M_up, p->K_up));
+
+    // 13. SwiGLU
+    QP_TIME(QP_SWIGLU, swiglu(ws->intermediate, ws->gate_buf, ws->up_buf, 3584));
+
+    // 14. MLP Down GEMV
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->down_buf, ws->intermediate, p->mant_down, p->exp_down, p->M_down, p->K_down));
+
+    // 15. Residual Add
+    QP_TIME(QP_RESID, add_residual(h, ws->down_buf, 1024));
+
+    if (g_qp_on) g_qp_ms[QP_LINEAR] += qp_now() - _tl;
+}
+
+void forward_mlp(const MlpPlan* p, float* h) {
+    LayerWorkspace* ws = &g_workspace;
+    double _tl = g_qp_on ? qp_now() : 0.0;
+    QP_TIME(QP_RMSNORM, rmsnorm(ws->post_normed, h, p->post_ln_w, 1024, 1e-6f));
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->gate_buf, ws->post_normed, p->mant_gate, p->exp_gate, p->M_gate, p->K_gate));
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->up_buf, ws->post_normed, p->mant_up, p->exp_up, p->M_up, p->K_up));
+    QP_TIME(QP_SWIGLU, swiglu(ws->intermediate, ws->gate_buf, ws->up_buf, 3584));
+    QP_TIME(QP_GEMV, bfp8_gemv(ws->down_buf, ws->intermediate, p->mant_down, p->exp_down, p->M_down, p->K_down));
+    QP_TIME(QP_RESID, add_residual(h, ws->down_buf, 1024));
+    if (g_qp_on) g_qp_ms[QP_MLP] += qp_now() - _tl;
+}
+
+typedef void (*FullAttnCallback)(int layer_idx, float* h, void* py_context);
+
+int forward_token_c(
+    int token_id,
+    float* h,
+    const LinearLayerPlan* linear_plans,
+    const MlpPlan* mlp_plans,
+    const int* layer_is_full,
+    const float* final_norm_w,
+    const uint16_t* embed_table,
+    FullAttnCallback full_attn_cb,
+    void* py_context
+) {
+    // 1. Embedding lookup (bf16 to float32)
+    const uint16_t* emb_row = embed_table + (size_t)(token_id % 65536) * 1024;
+    double _tt = g_qp_on ? qp_now() : 0.0;
+    for (int i = 0; i < 1024; i++) {
+        uint32_t u32 = ((uint32_t)emb_row[i]) << 16;
+        memcpy(h + i, &u32, 4);
+    }
+    if (g_qp_on) g_qp_ms[QP_EMBED] += qp_now() - _tt;
+
+    // 2. 24 Layers
+    int linear_idx = 0;
+    for (int l = 0; l < 24; l++) {
+        if (layer_is_full[l]) {
+            if (full_attn_cb) QP_TIME(QP_PYCALLBACK, full_attn_cb(l, h, py_context));
+            QP_TIME(QP_MLP, forward_mlp(&mlp_plans[l], h));
+        } else {
+            QP_TIME(QP_LINEAR, forward_linear_layer(&linear_plans[linear_idx], h));
+            linear_idx++;
+        }
+    }
+
+    // 3. Final RMSNorm
+    LayerWorkspace* ws = &g_workspace;
+    QP_TIME(QP_RMSNORM, rmsnorm(ws->normed, h, final_norm_w, 1024, 1e-6f));
+
+    // 4. LM_Head Argmax over 65536 embeddings
+    int best_id = 0;
+    QP_TIME(QP_LMHEAD, best_id = lm_head_argmax(ws->normed, embed_table, 65536, 1024));
+    if (g_qp_on) g_qp_ms[QP_TOTAL] += qp_now() - _tt;
+    return best_id;
+}

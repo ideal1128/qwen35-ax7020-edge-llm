@@ -1,0 +1,18 @@
+=== plclk measurement on AX7020 (COM4), 2026-11-03 ===
+board: Linux 4.9.0-xilinx armv7l, gcc 4.9.2, /dev/mem O_SYNC, 200000 reads per point
+
+FPGA0_CLK_CTRL orig = 0x00200500
+PL  read latency (orig clock) = 180.3 ns
+FPGA0_CLK_CTRL wrote 0x00100500, readback 0x00100500
+PL  read latency (200 MHz try) = 108.2 ns
+FPGA0_CLK_CTRL restored to 0x00200500 (readback 0x00200500)
+PL  read latency (restored) = 180.2 ns
+RATIO orig/try = 1.667
+
+Interpretation:
+  latency = fixed_ps + k/f_pl
+  180.3 = F + k/f0 ; 108.2 = F + k/(2*f0)
+  => k/f0 = 144.2 ns, F = 36.1 ns
+  => N_pl_cycles = 144.2 ns * 100 MHz = 14.4 cycles  (plausible AXI-Lite CDC round trip)
+  => confirms FCLK0 = 100 MHz and that 0x00100500 gives 200 MHz.
+  Restore verified byte-identical (180.2 ns, register back to 0x00200500).
