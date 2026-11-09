@@ -1,8 +1,7 @@
 // tb_gemv_core.v -- independent golden-model regression for gemv_core.
 //
 // The reference below is NOT a transcription of the RTL.  It evaluates the same
-// expression the software engine uses (qwen_kernels.c bfp8_gemv, pl_apply.c
-// pl_apply):
+// expression the software engine uses (qwen_kernels.c bfp8_gemv):
 //
 //     y[m] = sum_b (double)dots[m][b] * ldexp(1.0, exps[m][b]-134) * xscale[b]
 //
@@ -158,7 +157,7 @@ module tb_gemv_core;
         end
     endfunction
 
-    // Exactly pl_apply(): accumulate in double, per-block scale = 2^(e-134) * xscale.
+    // Reference model: accumulate in double, per-block scale = 2^(e-134) * xscale.
     function real calc_row_ref(input integer m_idx, input integer nb);
         real acc;
         integer bi;
@@ -201,7 +200,7 @@ module tb_gemv_core;
             repeat (3) @(posedge clk);
 
             seed = sd;
-            // x as int16 in [-16384, 16383] (the pl_quant range, max|xq| = 16384)
+            // x as int16 in [-16384, 16383] (the int16 quantisation range, max|xq| = 16384)
             for (i = 0; i < k; i = i + 1) begin
                 seed = seed * 1103515245 + 12345;
                 xq[i] = $signed(seed[15:0]) >>> 1;
@@ -252,7 +251,7 @@ module tb_gemv_core;
             nrecv = 0;
             nlast = 0;
 
-            // ---- header (fields [15:0],[23:16],[30:24],[31] unchanged, [39:32] new)
+            // ---- header
             beat = 128'd0;
             beat[15:0]  = xbeats;
             beat[23:16] = (nb * 4) - 1;

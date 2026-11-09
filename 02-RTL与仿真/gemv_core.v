@@ -12,19 +12,19 @@
 // AXI DMA permanently, so the core never ends a burst on its own.
 //
 //   beat 0        : header
-//                     tdata[15:0]  = x_beats                    (unchanged)
-//                     tdata[23:16] = beats_per_row - 1           (unchanged)
-//                     tdata[30:24] = exp_beats_per_row - 1       (unchanged)
-//                     tdata[31]    = dequant_en                  (unchanged)
-//                     tdata[39:32] = xs_beats                    (NEW, see below)
+//                     tdata[15:0]  = x_beats
+//                     tdata[23:16] = beats_per_row - 1
+//                     tdata[30:24] = exp_beats_per_row - 1
+//                     tdata[31]    = dequant_en
+//                     tdata[39:32] = xs_beats
 //                     all other bits reserved, drive 0
 //   next x_beats  : x, 8 int16 per beat
 //   next xs_beats : per-block x scale, 4 float32 per beat   (only if xs_beats != 0)
 //   then per row  : exp_beats beats of exponents (16 uint8 per beat)
 //                   followed by beats_per_row beats of weights (16 int8 per beat)
 //
-// xs_beats is the number of beats in the NEW x-scale phase.  The phase carries
-// the per-block x scale produced by pl_quant()/bfp8_gemv():
+// xs_beats is the number of beats in the x-scale phase.  The phase carries
+// the per-block x scale produced by bfp8_gemv():
 //
 //     amax = max|x| over the 64-element block
 //     xscale[b] = amax / 16384                (float32, one per block)
@@ -39,7 +39,7 @@
 // ---------------------------------------------------------------------------
 // 2. Arithmetic
 // ---------------------------------------------------------------------------
-// The software reference (qwen_kernels.c bfp8_gemv / pl_apply.c pl_apply) is
+// The software reference (qwen_kernels.c bfp8_gemv) is
 //
 //     y[m] = sum_b (float)dots[m][b] * EXP_SCALE[exps[m][b]] * xscale[b]
 //     EXP_SCALE[e] = ldexpf(1.0f, e - 134)
@@ -193,7 +193,7 @@ module gemv_core #(
     end
 
     // ==================================================================== pipeline
-    // S1..S5 : block dot product            (unchanged from the original core)
+    // S1..S5 : block dot product
     // S6     : capture the int32 block dot, launch the exponent / xscale reads
     // S7     : float32 xscale decode, alignment exponent sh = Ex + e - 110, |bd|
     // S8     : prod = block_dot * xs_mant   (and |prod| on a second DSP)

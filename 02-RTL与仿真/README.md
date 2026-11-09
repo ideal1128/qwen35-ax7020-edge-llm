@@ -4,7 +4,7 @@
 
 | 模块 | 功能 |
 |---|---|
-| `gemv_core.v` | **BFP8 GEMV 加速核心**：16 路并行 int8×int16 乘加，12 级流水，64 位饱和累加，AXI-Stream 从口 |
+| `gemv_core.v` | **BFP8 GEMV 加速核心**：16 路并行 int8×int16 乘加，11 级流水，64 位饱和累加，AXI-Stream 从口 |
 | `gemv_core_pipe.v` | GEMV 核心的深流水变体 |
 | `gdn_core.v` | Gated DeltaNet 递归状态更新加速器 |
 | `gdn_core_ref.v` | GDN 行为级参考模型 |
@@ -26,7 +26,8 @@
 
 ## 资源占用
 
-`util_*.rpt` 为各模块 out-of-context 综合资源报告。详见 `01-系统概述/HW_UTIL_ANALYSIS.md`。
+`util_*.rpt` 为各模块 out-of-context 综合资源报告。Block Design 整体资源与时序见
+`03-实测证据/util_bd_200mhz.rpt` 与 `03-实测证据/timing_bd_200mhz.rpt`。
 
 ## 设计说明
 

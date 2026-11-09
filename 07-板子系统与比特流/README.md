@@ -1,16 +1,29 @@
-# 板子系统镜像与比特流
+# 板子系统与比特流
+
+可直接烧录/加载的板级系统文件。
 
 | 文件 | 大小 | 说明 |
 |---|---|---|
-| `BOOT.BIN` | 2.30 MB | Zynq 启动镜像（FSBL + PL 比特流 + U-Boot），由 `ps7_init` 设定 PL 时钟 100 MHz |
-| `image.ub` | 4.05 MB | Linux 内核 + 设备树 + 根文件系统镜像（FIT 格式） |
-| `gemv_sys.bit` | 4.05 MB | PL 加速系统比特流（完整含 PS 配置） |
-| `gemv_sys.bit.bin` | 4.05 MB | 同上，raw 二进制形式，可通过 `/dev/xdevcfg` 动态加载 |
+| `BOOT.BIN` | 2.2 MB | 启动镜像：FSBL + bitstream + U-Boot，内含 `ps7_init`（设定 FCLK0 = 100 MHz） |
+| `image.ub` | 3.9 MB | Linux 内核 + 设备树 + initramfs |
+| `gemv_sys.bit.bin` | 3.9 MB | PL 比特流，Linux 下可直接加载的二进制格式 |
+
+## 烧录
+
+`BOOT.BIN` 与 `image.ub` 放入 SD 卡第一个 FAT 分区，从 SD 卡启动。
 
 ## 加载 PL 比特流
 
 ```bash
-cat /mnt/qwen/gemv_sys.bit.bin > /dev/xdevcfg
+cat gemv_sys.bit.bin > /dev/xdevcfg
 ```
 
-加载前建议先确认时钟配置未被改动（PL 时钟由 BOOT.BIN 中的 `ps7_init` 固定为 100 MHz）。
+或通过 fpga_manager：
+
+```bash
+echo 1 > /sys/class/fpga_manager/fpga0/flags
+cat gemv_sys.bit.bin > /sys/class/fpga_manager/fpga0/firmware
+```
+
+> 演示与推理默认使用纯 CPU 路径（`real_chat_v3` 不加载比特流），
+> 因此不加载 PL 也能完整运行。

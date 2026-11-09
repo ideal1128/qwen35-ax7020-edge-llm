@@ -222,7 +222,6 @@ class CTokenizer:
             self.tok_ptr = None
 
 
-# ==== BEGIN qwen_attn binding (patch_engine_attn.py) ====
 # Full attention in C+NEON.  The numpy path below builds a [8,T,256] copy of
 # K and V with np.repeat on every layer of every token; at T=544 that is a
 # 4.5 MB allocation per layer and it is what makes long conversations slow
@@ -308,10 +307,8 @@ def _attn_dispatch(pool, layer_idx, q):
     except Exception as exc:
         sys.stderr.write("[attn] C path failed, using numpy: %s\n" % (exc,))
         return pool.compute_attention(layer_idx, q)
-# ==== END qwen_attn binding ====
 
 
-# ==== BEGIN qwen_attn_post binding (patch_engine_attn_post.py) ====
 # attn_post_f32() replaces the numpy glue that used to sit between the four
 # gemvs and the o_proj gemv of a full-attention layer:
 #
@@ -515,7 +512,6 @@ def _attn_post(pool, layer_idx, pos, p, eng, yqgp, ykp, yvp):
     except Exception as exc:
         sys.stderr.write("[attn] C attn_post failed, using numpy: %s\n" % (exc,))
     return _attn_post_numpy(pool, layer_idx, pos, p, eng)
-# ==== END qwen_attn_post binding ====
 
 
 # ---------------------------------------------------------------------------
