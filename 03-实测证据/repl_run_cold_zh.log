@@ -1,0 +1,89 @@
+
+=== starting ./real_chat_v3 (default sampling, no --max) ===
+[13:21:46.194] [ctx] requesting 4096 tokens -> 256 blocks, rope table 4096
+[*] Initializing Qwen3.5-0.8B Real Hardware Engine...
+[*] Loading NEON SIMD Accelerated Kernel Library...
+[*] Loading 64K C-BPE Tokenizer from /mnt/qwen/tokenizer_64k.bin...
+[13:21:46.262] [*] Memmapping 128MB 64K Embedding Matrix from /mnt/qwen/embedding_64k.bin...
+[*] Memmapping 614MB 24-Layer BFP8 Weights Matrix[13:21:46.313]  from /mnt/qwen/qwen35_weights_64k.bin...
+[*] Parsing Model Architecture Manifest (320 Tensors) from /mnt/qwen/qwen35_weights_64k_manifest.json...
+[*] Pre-loading Conv1D and RMSNormGated Weights for 18 Linear Layers...
+[13:21:47.062] [*] Initializing PagedAttention Dynamic Memory Pool (256 Blocks / 4096 Context / 96.0 MB)...
+[13:21:47.250] [*] Engine Initialized! Ready for 100% Real Neural Network Inference.
+
+[init] engine ready in 1.043 s
+[13:21:47.375] ==================================================================
+  Qwen3.5-0.8B on ALINX AX7020  (CPU path, 24 layers, 64K vocab)
+  ChatML | 4096 ctx | no hard cap (stops at <|im_end|>)
+  reasoning: off
+  decoding: sampling T=0.70 top_k=40 top_p=0.90
+==================================================================
+[sample] temperature=0.70 top_k=40 top_p=0.90 (costs an extra lm_head pass, ~115 ms/token)
+[note] the first generated token includes weight staging;
+[note] on a cold page cache it can take ~29 s. Be patient.
+
+Type your message and press Enter.
+C[13:21:47.437] ommands: /clear  /think on|off  /think show|hide  /stats  /help  /quit
+Ctrl-C stops a reply without leaving.  Ctrl-D exits.
+
+you>   [13:21:47.443] PASS  REPL reached the you> prompt  
+  [13:21:47.447] PASS  banner reports 4096 ctx  
+  [13:21:47.447] PASS  banner reports reasoning off  
+  [13:21:47.448] PASS  banner reports sampling  
+  [13:21:47.449] PASS  pool sized to 4096 tokens  
+
+=== /help ===
+[13:21:47.500]   /clear  /new  /reset   drop the conversation and the KV cache
+  /think                  show the reasoning state
+  /think on | off         enable / disable the reasoning block
+  /think show | hide      print / suppress the reasoning text
+  /stats                  turns, tokens in KV, think state
+  /quit  /exit  /q        leave (also Ctrl-D)
+you>   [13:21:47.500] PASS  /help lists /clear  
+  [13:21:47.502] PASS  /help lists /think  
+
+=== /think ===
+[13:21:47.564] [think] reasoning is off, text is shown
+you>   [13:21:47.564] PASS  /think with no arg reports state  
+
+=== /think on ===
+[13:21:47.625] [think] reasoning ON for the next turn (expect 1.5-4 min per reply on this board)
+you>   [13:21:47.625] PASS  /think on acknowledged  
+[13:21:47.690] [think] reasoning is on, text is shown
+you>   [13:21:47.690] PASS  /think now reports on  
+
+=== /think off ===
+[13:21:47.753] [think] reasoning off for the next turn
+you>   [13:21:47.753] PASS  /think off acknowledged  
+
+=== /stats ===
+[13:21:47.815] [stats] 0 turns, 0/4096 tok in KV, think=off
+you>   [13:21:47.815] PASS  /stats reports KV occupancy  
+
+=== /clear ===
+[13:21:47.877] [clear] conversation and KV cache cleared
+you>   [13:21:47.877] PASS  /clear acknowledged  
+[13:21:47.940] [stats] 0 turns, 0/4096 tok in KV, think=off
+you>   [13:21:47.940] PASS  /clear really zeroed the KV  
+
+=== question (no --max): must end at <|im_end|> ===
+[13:21:48.002] [turn] feeding 29 new tokens (1 turns, 0/4096 tok in KV, think=off), reply budget 4059
+[13:21:51.314] [attn] C attn_post enabled (rmsnorm sum mode 0)
+[13:22:21.626] .[13:22:27.063] .[13:22:32.563] .[13:22:35.251] 
+[prefill] 47291.7 ms for 28 tokens (1689.0 ms/tok)
+[13:22:36.126] 你好[13:22:37.002] ，[13:22:37.875] 我是[13:22:38.688]  Q[13:22:39.564] wen[13:22:40.437] 3[13:22:41.314] .[13:22:42.189] 5[13:22:43.063] ，[13:22:43.938] 由[13:22:44.812] 通[13:22:45.625] 义[13:22:46.502] 实验室[13:22:47.377] 自主研发[13:22:48.251] 的[13:22:49.126] 超[13:22:50.000] 大规模[13:22:50.877] 语言[13:22:51.687] 模型[13:22:52.564] ，[13:22:53.438] 能够[13:22:54.313] 处理[13:22:55.188] 复杂[13:22:56.064] 逻辑[13:22:56.940] 、[13:22:57.813] 多[13:22:58.688] 模[13:22:59.563] 态[13:23:00.438] 推理[13:23:01.376] 和[13:23:02.188] 代码[13:23:03.062] 生成[13:23:04.000] ，[13:23:04.812] 致力于[13:23:05.689] 让[13:23:06.563]  AI[13:23:07.440]  [13:23:08.375] 更[13:23:09.188] 懂[13:23:10.063] 中国[13:23:10.940] 、[13:23:11.815] 更[13:23:12.689] 懂[13:23:13.565] 中国[13:23:14.501] 、[13:23:15.377] 更[13:23:16.250] 懂[13:23:17.127] 中国[13:23:18.000] 。[13:23:18.875] 
+[gen] 49 tokens in 43599.8 ms (50 fwd, first 856.4 ms, avg 872.0 ms/tok = 1.147 tok/s)
+[gen] unique ids 38/49
+[gen] stop: <|im_end|> (natural end of answer, not truncated)
+[gen] ids = [48536, 3698, 43001, 1166, 16356, 18, 13, 20, 3698, 35720, 35429, 35740, 43188, 56622, 35323, 35926, 44295, 37571, 43002, 3698, 362  [13:23:18.875] PASS  generation finished  
+  [13:23:18.876] PASS  stopped naturally at <|im_end|>  
+  [13:23:18.876] PASS  answer was NOT cut by a budget  
+  info  49 tokens, 43599.8 ms, 50 fwd
+
+=== /quit ===
+[13:23:18.885] 65, 36289, 39257, 41120, 5188, 35364, 35885, 35887, 51161, 35333, 38165, 43187, 3698, 40158, 35656, 14712, 220, 35455, 36972, 35[13:23:18.938] 713, 5188, 35455, 36972, 35713, 5188, 35455, 36972, 35713, 1706]
+[gen] utf8 = E4 BD A0 E5 A5 BD EF BC 8C E6 88 91 E6 98 AF 20 51 77 65 6E 33 2E 35 EF BC 8C E7 94 B1 E9 80 9A E4 B9 89 E5 AE 9E E9 AA 8C E5 AE A4 E8 87 AA E4 B8 BB E7 A0 94 E5 8F 91 E7 9A 84 E8 B6 85 E5 A4 A7 E8 A7 84 E6 A8 A1 E8 AF AD E8 A8 80 E6 A8 A1 E5 9E 8B EF BC 8C E8 83 BD E5 A4 9F E5 A4 84 E7 90 86 E5 A4 8D E6 9D 82 E9 80 BB E8 BE 91 E3 80 81 E5 A4 9A E6 A8 A1 E6 80 81 E6 8E A8 E7 90 86 E5 92 8C E4 BB A3 E7 A0 81 E7 94 9F E6 88 90 EF BC 8C E8 87 B4 E5 8A 9B E4 BA 8E E8 AE A9 20 41 49 20 E6 9B B4 E6[13:23:19.001]  87 82 E4 B8 AD E5 9B BD E3 80 81 E6 9B B4 E6 87 82 E4 B8 AD E5 9B BD E3 80 81 E6 9B B4 E6 87 82 E4 B8 AD E5 9B BD E3 80 82
+[gen] ascii-safe = '\\u4f60\\u597d\\uff0c\\u6211\\u662f Qwen3.5\\uff0c\\u7531\\u901a\\u4e49\\u5b9e\\u9a8c\\u5ba4\\u81ea\\u4e3b\\u7814\\u53d1\\u7684\\u8d85\\u5927\\u89c4\\u6a21\\u8bed\\u8a00\\u6a21\\u578b\\uff0c\\u80fd\\u591f\\u5904\\u7406\\u590d\\u6742\\u903b\\u8f91\\u3001\\u591a\\u6a21\\u6001\\u63a8\\u7406\\u548c\\u4ee3\\u7801\\u751f\\u6210\\uff0c\\u81f4\\u529b\\u4e8e\\u8ba9 AI \\u66f4\\u61c2\\u4e2d\\u56fd\\u3001\\u66f4\\u61c2\\u4e2d\\u56fd\\u3001\\u66f4\\u61c2\\u4e2d\\u56fd\\u3002'
+you> bye
+  [13:23:19.001] PASS  /quit returns to the shell  
+[13:23:19.315] root@zynq:/mnt/qwen# 

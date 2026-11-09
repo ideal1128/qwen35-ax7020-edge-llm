@@ -1,0 +1,83 @@
+=== starting ./real_chat_v3 (default sampling, no --max) ===
+cd /mnt/qwen && ./real_chat_v3
+[ctx] requesting 4096 tokens -> 256 blocks, rope table 4096
+[*] Initializing Qwen3.5-0.8B Real Hardware Engine...
+[*] Loading NEON SIMD Accelerated Kernel Library...
+[*] Loading 64K C-BPE Tokenizer from /mnt/qwen/tokenizer_64k.bin...
+[*] Memmapping 128MB 64K Embedding Matrix from /mnt/qwen/embedding_64k.bin...
+[*] Memmapping 614MB 24-Layer BFP8 Weights Matrix from /mnt/qwen/qwen35_weights_64k.bin...
+[*] Parsing Model Architecture Manifest (320 Tensors) from /mnt/qwen/qwen35_weights_64k_manifest.json...
+[*] Pre-loading Conv1D and RMSNormGated Weights for 18 Linear Layers...
+[*] Initializing PagedAttention Dynamic Memory Pool (256 Blocks / 4096 Context / 96.0 MB)...
+[*] Engine Initialized! Ready for 100% Real Neural Network Inference.
+
+[init] engine ready in 0.294 s
+==================================================================
+  Qwen3.5-0.8B on ALINX AX7020  (CPU path, 24 layers, 64K vocab)
+  ChatML | 4096 ctx | no hard cap (stops at <|im_end|>)
+  reasoning: off
+  decoding: sampling T=0.70 top_k=40 top_p=0.90
+==================================================================
+[sample] temperature=0.70 top_k=40 top_p=0.90 (costs an extra lm_head pass, ~115 ms/token)
+[note] the first generated token includes weight staging;
+[note] on a cold page cache it can take ~29 s. Be patient.
+
+Type your message and press Enter.
+Commands: /clear  /think on|off  /think show|hide  /stats  /help  /quit
+Ctrl-C stops a reply without leaving.  Ctrl-D exits.
+
+you>
+=== /help ===
+/help
+  /clear  /new  /reset   drop the conversation and the KV cache
+  /think                  show the reasoning state
+  /think on | off         enable /disable the reasoning block
+  /think show | hide      print /suppress the reasoning text
+  /stats                  turns, tokens in KV, think state
+  /quit  /exit  /q        leave (also Ctrl-D)
+you>
+=== /think ===
+/think
+[think] reasoning is off, text is shown
+you>
+=== /think on ===
+/think on
+[think] reasoning ON for the next turn (expect 1.5-4 min per reply on this board)
+you>
+/think
+[think] reasoning is on, text is shown
+you>
+=== /think off ===
+/think off
+[think] reasoning off for the next turn
+you>
+=== /stats ===
+/stats
+[stats] 0 turns, 0/4096 tok in KV, think=off
+you>
+=== /clear ===
+/clear
+[clear] conversation and KV cache cleared
+you>
+/stats
+[stats] 0 turns, 0/4096 tok in KV, think=off
+you>
+
+=== question (no --max): must end at <|im_end|> ===
+[13:20:41.625] What is 2+2? Answer in one short sentence.
+[turn] feeding 34 new tokens (1 turns, 0/4096 tok in KV, think=off), reply budget 4054
+[13:20:41.688] [attn] C attn_post enabled (rmsnorm sum mode 0)
+[13:20:47.125] .[13:20:52.563] .[13:20:58.063] .[13:21:03.564] .[13:21:04.250]
+[prefill] 22638.0 ms for 33 tokens (686.0 ms/tok)
+[13:21:05.127] 2[13:21:06.002]  +[13:21:06.812]  [13:21:07.687] 2[13:21:08.565]  =[13:21:09.439]  [13:21:10.314] 4[13:21:11.188]
+[gen] 7 tokens in 6915.4 ms (8 fwd, first 872.7 ms, avg 864.4 ms/tok = 1.157 tok/s)
+[gen] unique ids 5/7
+[gen] stop: <|im_end|> (natural end of answer, not truncated)
+[gen] ids = [17, 477, 220, 17, 282, 220, 19]
+[gen] utf8 = 32 20 2B 20 32 20 3D 20 34
+[gen] ascii-safe = '2 + 2 = 4'
+you>
+=== /quit ===
+[13:21:11.267] /quit
+bye
+[13:21:11.578] root@zynq:/mnt/qwen#
